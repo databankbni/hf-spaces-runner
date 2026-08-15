@@ -1,0 +1,452 @@
+name: ia-archive
+
+# Lapis dingin: dump bertanggal ke arsip publik pihak ketiga.
+#
+# Tiga jalur pengiriman:
+#   s3      - item archive.org sungguhan lewat s3.us.archive.org. BUTUH
+#             IA_ACCESS_KEY + IA_SECRET_KEY. Tanpa kunci, S3 selalu membalas
+#             403 InvalidAccessKeyId; tidak ada mode anonim.
+#   swh-tree- TANPA kunci, dan ini jalur BAKU sekarang. Mengirim berkas Space
+#             apa adanya (bukan zip) ke 16 repo mirror publik permanen yang
+#             dipilih dari sha1(id Space), plus kolam gemuk untuk Space > 256
+#             MiB. Karena SWH beralamat-isi, tiap Space punya SWHID direktori
+#             sendiri: satu app 80 KB diambil sebagai 80 KB, bukan sebagai
+#             dump 4,37 GiB. Bulan kedua dan seterusnya hanya mengirim delta.
+#             Verifikasi memakai sifat Merkle git: root tree tiap shard cocok
+#             => seluruh subpohon Space di dalamnya terbukti.
+#   swh     - TANPA kunci sama sekali (jalur zip lama). Zip dipotong jadi bagian
+#             <= 95 MiB, dikelompokkan jadi beberapa repo publik sekali-pakai
+#             di bawah batas pack Software Heritage (4 GiB/repo), lalu tiap
+#             repo diminta diarsipkan lewat "Save Code Now" ANONIM. SWH
+#             menyimpan seluruh objek git permanen dan mengembalikan byte
+#             mentahnya lewat satu HTTP GET per blob. Verifikasi eksak karena
+#             SWH memakai alamat-berbasis-isi (sha1_git) dan melaporkan sha256.
+#             Repo sekali-pakainya dihapus setelah terverifikasi.
+#   wayback - TANPA kunci juga, lewat Save Page Now. Dipertahankan sebagai
+#             cadangan, tetapi TIDAK dianjurkan untuk dump besar: SPN banyak
+#             mendiamkan submisi biner 95 MiB dan verifikasinya lambat
+#             (run 31056426716 dibatalkan setelah ~100 menit, hanya sebagian
+#             bagian tertangkap).
+#
+# 2026-08-15: workflow ini DIPINDAH dari repo privat databankbni/hf-spaces-backup
+# ke repo publik databankbni/hf-spaces-runner. Kuota Actions repo privat (2.000
+# menit/bulan pada paket Free) habis 2026-08-14 04:20Z -- ia-archive sendiri
+# ikut menghabiskannya (677 menit dalam 16 run bulan Agustus) -- dan sejak itu
+# SEMUA run di repo data ditolak sebelum langkah pertama. Menit Actions repo
+# publik gratis. Kode + data tetap di repo privat, di-checkout memakai SHIP_PAT.
+#
+# Tidak ada tool pengiriman di sini yang memakai GITHUB_REPOSITORY (sudah
+# diperiksa: iaship.py, swhship.py, wayship.py, swhtree.py tidak menyentuhnya),
+# jadi selain checkout tidak ada yang perlu diarahkan ulang. Repo mirror publik
+# untuk SWH memang dibuat sendiri oleh tool lewat SHIP_PAT, bukan repo ini.
+#
+# CATATAN KUNCI YANG HILANG: IA_ACCESS_KEY dan IA_SECRET_KEY tidak ada di repo
+# privat dan nilai rahasia tidak bisa dibaca balik lewat API, jadi jalur `s3`
+# (item archive.org sungguhan) akan otomatis jatuh ke mode kering sampai
+# pemilik akun memasukkan ulang kedua kunci itu di repo runner. Jalur baku
+# swh-tree tidak butuh kunci apa pun dan tetap jalan.
+
+# Jalur swh dan wayback butuh secrets.SHIP_PAT (PAT yang boleh membuat dan
+# menghapus repo publik milik pemilik repo ini).
+#
+# Ini SENGAJA bukan pengganti backup harian ke GitHub: keduanya salinan dingin
+# tanpa diff/patch, jadi setiap periode berarti pengiriman penuh.
+#
+# Dump ini PUBLIK dan permanen. `iaship.py build` memindai seluruh pohon dengan
+# 26 pola kredensial + 47 pola nama berkas lalu MENGELUARKAN berkas yang cocok
+# (--on-secret exclude); nama berkasnya tetap dicatat di manifes supaya pemilik
+# Space tahu kuncinya perlu dicabut. Langkah `plan` sengaja tidak memindai
+# (--no-secret-scan) karena `build` sudah memindai.
+
+on:
+  schedule:
+    # Hari ke-2 tiap bulan, 04:17 UTC. Jauh dari slot backup (02:43) dan
+    # publish-index (00:27/06:27/12:27/18:27) supaya tidak rebutan runner.
+    - cron: '17 4 2 * *'
+  workflow_dispatch:
+    inputs:
+      period:
+        description: 'label periode, mis. 2026.08 (kosong = bulan berjalan)'
+        default: ''
+      dry_run:
+        description: 'bangun + periksa saja, tanpa mengirim'
+        type: boolean
+        default: true
+      include:
+        description: 'direktori yang ikut, dipisah koma'
+        default: 'spaces,manifest,archive'
+      route:
+        description: 'jalur pengiriman'
+        type: choice
+        options: [auto, swh-tree, swh, wayback, s3]
+        default: auto
+      verify:
+        description: 'kedalaman verifikasi jalur wayback'
+        type: choice
+        options: [spot, full, none]
+        default: spot
+      part_mib:
+        description: 'ukuran satu bagian (MiB, batas keras GitHub 100 MB)'
+        default: '95'
+      shard_mib:
+        description: 'ukuran satu repo shard (MiB, batas keras SWH 4096)'
+        default: '2800'
+      deep:
+        description: 'jalur swh: berapa bagian per shard diunduh ulang untuk uji hash'
+        default: '1'
+      shards:
+        description: 'jalur swh-tree: jumlah ember stabil'
+        default: '16'
+      fat_mib:
+        description: 'jalur swh-tree: di atas ini Space masuk kolam gemuk'
+        default: '256'
+      only:
+        description: 'jalur swh-tree: kirim sebagian shard saja, mis. s0,s1 (kosong = semua)'
+        default: ''
+      sample:
+        description: 'jalur swh-tree: berapa Space dicek hidup lewat API per shard'
+        default: '60'
+      topup:
+        description: 'jalur swh-tree: tambal lubang cakupan dari HF (overflow,lfs,oversize / all / kosong)'
+        default: ''
+      topup_max_mib:
+        description: 'jalur swh-tree: pagu per-blob tambalan (MiB)'
+        default: '25'
+      topup_space_mib:
+        description: 'jalur swh-tree: pagu per-Space tambalan (MiB)'
+        default: '512'
+      topup_budget_mib:
+        description: 'jalur swh-tree: pagu per-shard tambalan (MiB)'
+        default: '1024'
+      topup_files_space:
+        description: 'pagu jumlah berkas tambalan per-Space'
+        required: false
+        default: '2000'
+      topup_files_budget:
+        description: 'pagu jumlah berkas tambalan per-shard'
+        required: false
+        default: '6000'
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: ia-archive
+  cancel-in-progress: false
+
+jobs:
+  ship:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      ITEM: hf-spaces-archive
+      NAME: hf-spaces-archive
+      INCLUDE: ${{ inputs.include || 'spaces,manifest,archive' }}
+      DRY: ${{ (github.event_name == 'schedule' && 'false') || (inputs.dry_run && 'true') || 'false' }}
+    steps:
+      # Wajib. Pohon kerja 11,6 GB + .git 4,1 GB = 15,7 GB, sementara runner
+      # cuma punya ~15 GB kosong sebelum dibersihkan. Persis inilah yang
+      # membunuh run 30978760164 di watchdog.
+      - name: Free runner disk
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/.ghcup /usr/local/share/boost \
+                      /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/Ruby \
+                      /opt/hostedtoolcache/go /opt/hostedtoolcache/node || true
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h / | tail -1
+
+      # repository + token: kode DAN pohon spaces/ ada di repo LAIN yang privat.
+      # persist-credentials wajib true -- langkah "Record the shipment" mendorong
+      # manifest/ia.jsonl dkk kembali ke repo data lewat remote origin ini.
+      - uses: actions/checkout@v4
+        with:
+          repository: databankbni/hf-spaces-backup
+          token: ${{ secrets.SHIP_PAT }}
+          fetch-depth: 1
+          persist-credentials: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Resolve period
+        id: p
+        run: |
+          P="${{ inputs.period }}"
+          [ -n "$P" ] || P="$(date -u +%Y.%m)"
+          echo "period=$P" >> "$GITHUB_OUTPUT"
+          echo "periode: $P   include: $INCLUDE   dry_run: $DRY"
+
+      - name: Pick the route
+        id: r
+        env:
+          IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
+          IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
+          SHIP_PAT: ${{ secrets.SHIP_PAT }}
+        run: |
+          R="${{ inputs.route || 'auto' }}"
+          if [ "$R" = "auto" ]; then
+            if [ -n "$IA_ACCESS_KEY" ] && [ -n "$IA_SECRET_KEY" ]; then R=s3; else R=swh-tree; fi
+          fi
+          if [ "$R" = "s3" ] && { [ -z "$IA_ACCESS_KEY" ] || [ -z "$IA_SECRET_KEY" ]; }; then
+            echo "::warning::jalur s3 dipilih tapi kunci kosong -> dipaksa mode kering"
+            echo "forced_dry=1" >> "$GITHUB_OUTPUT"
+          fi
+          case "$R" in wayback|swh|swh-tree) NEEDPAT=1 ;; *) NEEDPAT= ;; esac
+          if [ -n "$NEEDPAT" ] && [ -z "$SHIP_PAT" ] && [ "$DRY" != "true" ]; then
+            echo "::error::jalur $R butuh secrets.SHIP_PAT"; exit 1
+          fi
+          echo "route=$R" >> "$GITHUB_OUTPUT"
+          echo "jalur: $R   dry: $DRY"
+
+      - name: Plan the dump
+        if: steps.r.outputs.route != 'swh-tree'
+        run: |
+          df -h / | tail -1
+          python tools/iaship.py plan --root . --include "$INCLUDE" --no-secret-scan
+
+      - name: Build dated dump
+        id: b
+        if: steps.r.outputs.route != 'swh-tree'
+        run: |
+          mkdir -p "$RUNNER_TEMP/ia"
+          python tools/iaship.py build \
+            --root . --include "$INCLUDE" \
+            --outdir "$RUNNER_TEMP/ia" \
+            --period "${{ steps.p.outputs.period }}" \
+            --name "$NAME" \
+            --on-secret exclude
+          Z="$RUNNER_TEMP/ia/${{ steps.p.outputs.period }}.$NAME.zip"
+          M="$RUNNER_TEMP/ia/${{ steps.p.outputs.period }}.$NAME.manifest.json"
+          ls -l "$Z" "$M"
+          echo "zip=$Z" >> "$GITHUB_OUTPUT"
+          echo "man=$M" >> "$GITHUB_OUTPUT"
+          df -h / | tail -1
+
+      # ------------------------------------------------------------- jalur s3
+      - name: Upload to archive.org
+        id: up
+        if: steps.r.outputs.route == 's3'
+        env:
+          IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
+          IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
+        run: |
+          FLAG=""
+          if [ "$DRY" = "true" ] || [ "${{ steps.r.outputs.forced_dry }}" = "1" ]; then
+            FLAG="--dry-run"
+            echo "::notice::mode kering, tidak mengunggah"
+          fi
+          # Berkas dump: derive AKTIF supaya IA membuat daftar isi
+          # (<nama>.zip.txt) -- itu yang memberi tombol "View Contents".
+          python tools/iaship.py upload \
+            --item "$ITEM" --file "${{ steps.b.outputs.zip }}" $FLAG \
+            --make-bucket \
+            --mediatype software \
+            --title "HF Spaces Archive" \
+            --description "Snapshot berkala isi Hugging Face Spaces publik. Satu berkas zip per periode, dinamai <tahun>.<bulan>.hf-spaces-archive.zip. Tiap zip memuat pohon berkas apa adanya beserta manifest metadata. Blob Git LFS di atas 1 MiB tidak disertakan dan dicatat di _lfs_skipped.json pada tiap Space." \
+            --subject "software; source code; snapshot; web archive"
+          # Sidecar manifes: derive MATI, tidak perlu daftar isi untuk 1 JSON.
+          python tools/iaship.py upload \
+            --item "$ITEM" --file "${{ steps.b.outputs.man }}" $FLAG --no-derive
+          echo "dry=$FLAG" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the item
+        if: steps.r.outputs.route == 's3' && steps.up.outputs.dry == ''
+        run: |
+          # Beri IA waktu mencerna sebelum bertanya balik.
+          sleep 60
+          python tools/iaship.py verify --item "$ITEM" \
+            --manifest "${{ steps.b.outputs.man }}"
+
+      # -------------------------------- jalur swh-tree (baku, tanpa kunci)
+      - name: Ship per-Space trees to Software Heritage
+        id: st
+        if: steps.r.outputs.route == 'swh-tree'
+        env:
+          GH_TOKEN: ${{ secrets.SHIP_PAT }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          FLAG=""
+          [ "$DRY" = "true" ] && FLAG="--dry-run"
+          [ -n "${{ inputs.only }}" ] && FLAG="$FLAG --only ${{ inputs.only }}"
+          [ -n "${{ inputs.topup }}" ] && FLAG="$FLAG --topup ${{ inputs.topup }}"
+          OUT="manifest/swhtree/${{ steps.p.outputs.period }}.json"
+          mkdir -p manifest/swhtree
+          python tools/swhtree.py plan --root spaces \
+            --shards "${{ inputs.shards || '16' }}" \
+            --fat-mib "${{ inputs.fat_mib || '256' }}"
+          python tools/swhtree.py ship \
+            --root spaces \
+            --period "${{ steps.p.outputs.period }}" \
+            --owner "${{ github.repository_owner }}" \
+            --shards "${{ inputs.shards || '16' }}" \
+            --fat-mib "${{ inputs.fat_mib || '256' }}" \
+            --sample "${{ inputs.sample || '60' }}" \
+            --topup-max-mib "${{ inputs.topup_max_mib || '25' }}" \
+            --topup-space-mib "${{ inputs.topup_space_mib || '512' }}" \
+            --topup-budget-mib "${{ inputs.topup_budget_mib || '1024' }}" \
+            --topup-files-space "${{ inputs.topup_files_space || '2000' }}" \
+            --topup-files-budget "${{ inputs.topup_files_budget || '6000' }}" \
+            --workdir "$RUNNER_TEMP/swhtree" \
+            --keep-repo \
+            --out "$OUT" $FLAG
+          echo "out=$OUT" >> "$GITHUB_OUTPUT"
+          # Palang terakhir: repo mirror itu publik dan permanen. Kalau
+          # pemindaian kredensial tidak jalan, kiriman ini harus dianggap gagal
+          # walaupun semua hash cocok.
+          OUT="$OUT" python - <<'PY'
+          import json, os, pathlib, sys
+          i = json.loads(pathlib.Path(os.environ["OUT"]).read_text())
+          if not i.get("secret_scan"):
+              sys.exit("BATAL: pemindaian kredensial mati pada kiriman publik")
+          print("pemindaian kredensial: AKTIF, %d berkas disaring, %d Space kosong"
+                % (i.get("redacted", 0), len(i.get("kosong", []))))
+          t = i.get("topup") or {}
+          if t.get("kinds"):
+              print("tambalan %s: +%d berkas / %.1f MiB di %d Space "
+                    "(lewat %d, gagal %d, sha beda %d)"
+                    % (",".join(t["kinds"]), t.get("files", 0),
+                       t.get("bytes", 0) / 1048576, t.get("spaces", 0),
+                       t.get("lewat", 0), t.get("gagal", 0), t.get("beda", 0)))
+          PY
+          df -h / | tail -1
+
+      # ------------------------------------------ jalur swh (zip, tanpa kunci)
+      - name: Ship to Software Heritage without keys
+        id: sw
+        if: steps.r.outputs.route == 'swh'
+        env:
+          GH_TOKEN: ${{ secrets.SHIP_PAT }}
+        run: |
+          FLAG=""
+          [ "$DRY" = "true" ] && FLAG="--dry-run"
+          OUT="manifest/swh/${{ steps.p.outputs.period }}.json"
+          python tools/swhship.py ship \
+            --zip "${{ steps.b.outputs.zip }}" \
+            --period "${{ steps.p.outputs.period }}" \
+            --owner "${{ github.repository_owner }}" \
+            --prefix "${{ steps.p.outputs.period }}.$NAME.zip" \
+            --part-mib "${{ inputs.part_mib || '95' }}" \
+            --shard-mib "${{ inputs.shard_mib || '2800' }}" \
+            --deep "${{ inputs.deep || '1' }}" \
+            --extra "${{ steps.b.outputs.man }}" \
+            --rm-source \
+            --out "$OUT" $FLAG
+          echo "out=$OUT" >> "$GITHUB_OUTPUT"
+          df -h / | tail -1
+
+      # -------------------------------------------------------- jalur wayback
+      - name: Ship to Wayback without keys
+        id: wb
+        if: steps.r.outputs.route == 'wayback'
+        env:
+          GH_TOKEN: ${{ secrets.SHIP_PAT }}
+        run: |
+          FLAG=""
+          [ "$DRY" = "true" ] && FLAG="--dry-run"
+          OUT="manifest/wayback/${{ steps.p.outputs.period }}.json"
+          python tools/wayship.py ship \
+            --zip "${{ steps.b.outputs.zip }}" \
+            --period "${{ steps.p.outputs.period }}" \
+            --owner "${{ github.repository_owner }}" \
+            --prefix "${{ steps.p.outputs.period }}.$NAME.zip" \
+            --part-mib "${{ inputs.part_mib || '95' }}" \
+            --verify "${{ inputs.verify || 'spot' }}" \
+            --extra "${{ steps.b.outputs.man }}" \
+            --rm-source \
+            --out "$OUT" $FLAG
+          echo "out=$OUT" >> "$GITHUB_OUTPUT"
+          df -h / | tail -1
+
+      # --------------------------------------------------------------- catatan
+      - name: Record the shipment
+        # `always()`: manifes itu BUKTI. Run 31085240624 mengirim 8 shard,
+        # semuanya `visit=full` dengan ROOT COCOK, tetapi langkah ini dilewati
+        # karena pemeriksaan sampel kena kuota API SWH -- jadi mirror dan
+        # snapshot-nya hidup sementara catatannya hilang. Catat dulu, baru
+        # biarkan run-nya merah.
+        if: always() && env.DRY != 'true' && (steps.up.outputs.dry == '' || steps.wb.outputs.out != '' || steps.sw.outputs.out != '' || steps.st.outputs.out != '')
+        env:
+          MAN: ${{ steps.b.outputs.man }}
+          WB: ${{ steps.wb.outputs.out }}
+          SW: ${{ steps.sw.outputs.out }}
+          ST: ${{ steps.st.outputs.out }}
+          ITEM: hf-spaces-archive
+          ROUTE: ${{ steps.r.outputs.route }}
+        run: |
+          python - <<'PY'
+          import json, os, pathlib
+          route = os.environ["ROUTE"]
+          if route == "swh-tree":
+              idx = json.loads(pathlib.Path(os.environ["ST"]).read_text())
+              sh = idx["shards"]
+              row = {"file": f"{idx['period']}.swh-tree",
+                     "size": idx["bytes"], "route": "swh-tree",
+                     "period": idx["period"], "shards": len(sh),
+                     "spaces": idx["spaces"], "files": idx["files"],
+                     "redacted": idx.get("redacted", 0),
+                     "topup": (idx.get("topup") or {}).get("files", 0),
+                     "topup_bytes": (idx.get("topup") or {}).get("bytes", 0),
+                     "verified": sum(1 for s in sh
+                                     if s.get("root_dir") == s.get("root_tree")),
+                     "snapshots": [s.get("snapshot") for s in sh
+                                   if s.get("snapshot")],
+                     "origins": [s.get("origin") for s in sh],
+                     "index": os.environ["ST"], "run": os.environ["GITHUB_RUN_ID"]}
+          elif route == "swh":
+              idx = json.loads(pathlib.Path(os.environ["SW"]).read_text())
+              row = {"file": idx["zip"]["nama"], "size": idx["zip"]["bytes"],
+                     "sha256": idx["zip"]["sha256"], "md5": idx["zip"]["md5"],
+                     "route": "swh", "period": idx["period"],
+                     "shards": len(idx["shard"]),
+                     "verified": idx.get("terverifikasi"),
+                     "files": idx.get("total_berkas"),
+                     "snapshots": [s.get("snapshot") for s in idx["shard"]],
+                     "index": os.environ["SW"], "run": os.environ["GITHUB_RUN_ID"]}
+          elif route == "wayback":
+              idx = json.loads(pathlib.Path(os.environ["WB"]).read_text())
+              row = {"file": idx["zip"]["nama"], "size": idx["zip"]["bytes"],
+                     "sha256": idx["zip"]["sha256"], "md5": idx["zip"]["md5"],
+                     "route": "wayback", "period": idx["period"],
+                     "parts": idx["total_bagian"], "captured": idx["tertangkap"],
+                     "index": os.environ["WB"], "run": os.environ["GITHUB_RUN_ID"]}
+          else:
+              row = json.loads(pathlib.Path(os.environ["MAN"]).read_text())
+              row["route"] = "s3"
+              row["item"] = os.environ["ITEM"]
+              row["url"] = f"https://archive.org/download/{os.environ['ITEM']}/{row['file']}"
+              row["run"] = os.environ["GITHUB_RUN_ID"]
+          p = pathlib.Path("manifest/ia.jsonl")
+          rows = [l for l in (p.read_text().split("\n") if p.exists() else []) if l.strip()]
+          rows = [r for r in rows if json.loads(r).get("file") != row["file"]]
+          rows.append(json.dumps(row, sort_keys=True))
+          p.write_text("\n".join(rows) + "\n")
+          print(f"manifest/ia.jsonl: {len(rows)} baris")
+          PY
+          git config user.name  'hf-backup-bot'
+          git config user.email '147588423+databankbni@users.noreply.github.com'
+          git add manifest/ia.jsonl manifest/wayback manifest/swh manifest/swhtree 2>/dev/null || git add manifest/ia.jsonl
+          if git diff --cached --quiet; then
+            echo "tidak ada perubahan"
+          else
+            git commit -q -m "ia: catat pengiriman ${{ steps.p.outputs.period }} (${{ steps.r.outputs.route }})"
+            for i in 1 2 3; do
+              git push -q && { echo "push ok"; break; }
+              git pull -q --rebase || true
+              sleep $((i * 5))
+            done
+          fi
+
+      - name: Open an issue when shipping fails
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner, repo: context.repo.repo,
+              title: `ia-archive gagal untuk ${{ steps.p.outputs.period }}`,
+              body: `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+            });
