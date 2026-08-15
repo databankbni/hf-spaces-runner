@@ -208,6 +208,7 @@ jobs:
           # berlaku untuk repo runner dan tidak bisa mendorong ke repo data.
           GITHUB_TOKEN: ${{ secrets.SHIP_PAT }}
           BACKUP_REPO_SLUG: databankbni/hf-spaces-backup
+          BACKUP_REPO_BRANCH: main
           ENGINE_REPO: databankbni/hf-spaces-backup
           ENGINE_BRANCH: engine-state
           HF_USER: js9ajs9as9
@@ -257,6 +258,7 @@ jobs:
         if: steps.dedup.outputs.run == 'true'
         env:
           BACKUP_REPO_SLUG: databankbni/hf-spaces-backup
+          BACKUP_REPO_BRANCH: main
         run: |
           python tools/mkindex.py
           if [ -n "$(git status --porcelain index.html)" ]; then
@@ -289,6 +291,7 @@ jobs:
           PAGES_SLUG: databankbni/hf-spaces-archive-index
           CATALOGUE_PASSWORD: ${{ secrets.CATALOGUE_PASSWORD }}
           BACKUP_REPO_SLUG: databankbni/hf-spaces-backup
+          BACKUP_REPO_BRANCH: main
         run: |
           set -u
           pip install --quiet cryptography
