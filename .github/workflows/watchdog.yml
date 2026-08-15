@@ -1,8 +1,7 @@
 name: watchdog
 
 # Guards against the silent-failure mode that matters most: a backup that stops
-# running without anyone noticing. Alerts if the manifest has not been refreshed
-# within the staleness window.
+# running without anyone noticing.
 #
 # 2026-08-15: workflow ini DIPINDAH dari repo privat databankbni/hf-spaces-backup
 # ke repo publik databankbni/hf-spaces-runner. Alasannya: kuota Actions repo
@@ -11,42 +10,55 @@ name: watchdog
 # Menit Actions di repo PUBLIK tidak dibatasi, jadi mesinnya pindah ke sini
 # sementara datanya tetap privat -- diambil lewat checkout dengan SHIP_PAT.
 #
-# Ironisnya watchdog inilah yang seharusnya menangkap insiden itu: ia juga
-# ikut mati karena kuota, jadi tidak ada issue yang terbuka. Sekarang ia
-# hidup di repo yang menitnya gratis, jadi tidak bisa dibungkam oleh kuota
-# repo data.
+# Insiden itu juga menelanjangi dua kelemahan watchdog versi lama, dan keduanya
+# diperbaiki di sini:
+#
+#   1. Ia ikut mati. Ia hidup di repo yang sama dengan yang ia awasi, jadi
+#      begitu kuota repo itu habis, penjaganya mati bersama yang dijaga.
+#      Sekarang ia hidup di repo yang menitnya gratis.
+#
+#   2. Ia hanya melihat UMUR manifest, dan ambangnya 48 jam dengan patroli
+#      sehari sekali -- artinya alarm paling cepat berbunyi ~2 hari setelah
+#      kejadian. Nyatanya katalog beku 36 jam dan watchdog masih bilang
+#      "belum basi". Sekarang: patroli tiap 6 jam, ambang 26 jam (satu backup
+#      harian yang bolong langsung terlihat besok paginya), DITAMBAH
+#      pemeriksaan kedua yang tidak menunggu data jadi basi sama sekali --
+#      ia membaca riwayat run dan langsung berteriak kalau backup/publish
+#      beruntun gagal, termasuk mengenali tanda khas pemblokiran kuota/tagihan
+#      (run gagal dalam beberapa detik tanpa langkah apa pun).
 
 on:
   schedule:
-    - cron: '41 6 * * *'
+    # Tiap 6 jam, bukan sekali sehari. Run ini ~20 detik dan menitnya gratis di
+    # repo publik, jadi tidak ada alasan menunggu sehari untuk tahu mesin mati.
+    - cron: '41 */6 * * *'
   workflow_dispatch:
     inputs:
       max_age_hours:
         description: 'alert when the last successful run is older than this'
-        default: '48'
+        default: '26'
 
 permissions:
-  # penjaga anti-dobel membaca daftar run workflow ini
+  # penjaga anti-dobel + pemeriksa riwayat run membaca daftar run
   actions: read
   contents: read
   issues: write
 
-env:
-  DATA_REPO: databankbni/hf-spaces-backup
-
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       # Penjaga anti-dobel. Lihat tools/../addguard.py di catatan kerja:
       # cron GitHub baru hidup 2026-08-05 (event schedule pertama akun ini,
       # telat 3 jam), sementara jam luar sudah menembak workflow ini lewat
-      # workflow_dispatch. Tanpa ini, satu hari jalan dua kali.
+      # workflow_dispatch. Tanpa ini, satu slot jalan dua kali.
       #
-      # Hanya event `schedule` yang bisa dilewati, dan hanya kalau sudah ada
-      # run workflow_dispatch yang SUKSES dalam 12 jam terakhir. Kalau jam
-      # luar mati, tidak ada run seperti itu, dan cron GitHub tetap dipakai
-      # sebagai cadangan.
+      # WINDOW_H sengaja 3 jam, bukan 12 seperti workflow lain. Jam luar
+      # menembak watchdog sekali sehari (07:01 UTC) sedangkan cron di sini
+      # empat kali sehari; dengan jendela 12 jam, dua dari empat patroli akan
+      # ikut terlewat dan detak 6-jam yang baru saja dipasang jadi sia-sia.
+      # Tiga jam cukup untuk menelan tabrakan 06:41-vs-07:01 dan tidak lebih.
       #
       # GITHUB_REPOSITORY di sini SENGAJA repo runner (bukan repo data):
       # riwayat run sekarang tinggal di repo ini.
@@ -55,7 +67,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           WF: watchdog.yml
-          WINDOW_H: '12'
+          WINDOW_H: '3'
           EVENT: ${{ github.event_name }}
           SELF: ${{ github.run_id }}
         run: |
@@ -106,6 +118,82 @@ jobs:
           print("run=true")
           PY
 
+      # Pemeriksaan yang TIDAK menunggu data jadi basi. Umur manifest baru
+      # bergerak setelah backup gagal berjam-jam; riwayat run bergerak
+      # seketika. Insiden 14 Agustus terlihat di sini dalam menit, bukan hari:
+      # empat workflow berbeda semuanya gagal dalam ~2 detik tanpa satu pun
+      # langkah dijalankan -- itu bukan bug kode, itu job yang ditolak sebelum
+      # start (kuota/tagihan). Dua kondisi dibedakan supaya isi issue-nya
+      # menyuruh orang melihat tempat yang benar.
+      - name: Periksa riwayat run (deteksi cepat)
+        if: steps.dedup.outputs.run == 'true'
+        id: hist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WATCH: backup.yml publish-index.yml
+          STREAK: '3'
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, sys, urllib.request
+
+          def note(m):
+              print(m, file=sys.stderr)
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          need = int(os.environ["STREAK"])
+          H = {"Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+               "Accept": "application/vnd.github+json",
+               "X-GitHub-Api-Version": "2022-11-28"}
+
+          def runs(wf):
+              url = (f"https://api.github.com/repos/{repo}/actions/workflows/{wf}"
+                     f"/runs?per_page=10&status=completed")
+              req = urllib.request.Request(url, headers=H)
+              with urllib.request.urlopen(req, timeout=30) as f:
+                  return json.load(f).get("workflow_runs", [])
+
+          def dur(r):
+              # run yang ditolak sebelum start selesai dalam hitungan detik
+              import calendar, time
+              def p(s):
+                  try:
+                      return calendar.timegm(time.strptime(s, "%Y-%m-%dT%H:%M:%SZ"))
+                  except Exception:
+                      return None
+              a, b = p(r.get("run_started_at") or ""), p(r.get("updated_at") or "")
+              return (b - a) if (a and b) else None
+
+          bad, blocked, lines = [], [], []
+          for wf in os.environ["WATCH"].split():
+              try:
+                  rs = runs(wf)
+              except Exception as e:
+                  note(f"{wf}: API gagal ({e}) -- dilewati")
+                  continue
+              if not rs:
+                  note(f"{wf}: belum ada run selesai")
+                  continue
+              head = rs[:need]
+              concl = [r.get("conclusion") for r in head]
+              note(f"{wf}: {need} run terakhir -> {concl}")
+              if len(head) == need and all(c == "failure" for c in head):
+                  bad.append(wf)
+                  quick = [d for d in (dur(r) for r in head) if d is not None and d < 15]
+                  tag = ""
+                  if len(quick) == need:
+                      blocked.append(wf)
+                      tag = (" -- SEMUANYA gagal dalam <15 detik: tanda job "
+                             "ditolak sebelum start (kuota Actions / tagihan), "
+                             "bukan bug kode")
+                  lines.append(f"{wf}: {need} run terakhir gagal berturut-turut"
+                               f" (terbaru {head[0]['html_url']}){tag}")
+
+          print(f"degraded={'true' if bad else 'false'}")
+          print(f"blocked={'true' if blocked else 'false'}")
+          print("hist_reason=" + ("; ".join(lines) if lines
+                                  else "riwayat run backup/publish sehat"))
+          PY
+
       # Sparse ON PURPOSE. Pohon kerja repo data sudah 15,9 GB + ~5 GB .git,
       # sementara runner ubuntu-latest hanya punya ~14 GB kosong di disk OS.
       # Run 30978760164 (2026-08-05 05:39Z) mati di tengah checkout penuh
@@ -123,15 +211,20 @@ jobs:
             /manifest/
           sparse-checkout-cone-mode: false
 
+      # Ambang 26 jam, bukan 48. Backup jalan harian 02:43 UTC dan manifest
+      # ikut segar ~03:30, jadi pada patroli normal umurnya beberapa jam saja.
+      # Dengan 26 jam, SATU backup harian yang bolong sudah cukup memicu alarm;
+      # dengan 48 jam yang lama, butuh dua hari bolong -- dan itulah sebabnya
+      # katalog bisa beku 36 jam tanpa satu pun peringatan.
       - name: Evaluate freshness
         if: steps.dedup.outputs.run == 'true'
         id: check
         env:
-          MAX_AGE_HOURS: ${{ inputs.max_age_hours || '48' }}
+          MAX_AGE_HOURS: ${{ inputs.max_age_hours || '26' }}
         run: |
           python - <<'PY' >> "$GITHUB_OUTPUT"
           import json, os, time, calendar
-          max_age = float(os.environ.get("MAX_AGE_HOURS") or 48)
+          max_age = float(os.environ.get("MAX_AGE_HOURS") or 26)
           try:
               s = json.load(open("manifest/summary.json"))
           except Exception as e:
@@ -152,22 +245,49 @@ jobs:
       # GH_REPO dipaku ke repo runner. Tanpa ini `gh` menebak repo dari remote
       # git hasil checkout -- yaitu repo DATA yang privat -- dan token bawaan
       # workflow ini tidak punya izin membuka issue di sana.
-      - name: Alert on stale backup
-        if: steps.check.outputs.stale == 'true' && steps.dedup.outputs.run == 'true'
+      - name: Alert on stale or failing backup
+        if: >-
+          steps.dedup.outputs.run == 'true' &&
+          (steps.check.outputs.stale == 'true' || steps.hist.outputs.degraded == 'true')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           REASON: ${{ steps.check.outputs.reason }}
+          HIST: ${{ steps.hist.outputs.hist_reason }}
+          STALE: ${{ steps.check.outputs.stale }}
+          BLOCKED: ${{ steps.hist.outputs.blocked }}
         run: |
+          BODY="Backup pipeline needs attention."
+          if [ "$STALE" = "true" ]; then
+            BODY="${BODY}
+          - manifest stale: ${REASON}"
+          fi
+          BODY="${BODY}
+          - run history: ${HIST}"
+          if [ "$BLOCKED" = "true" ]; then
+            BODY="${BODY}
+
+          Jobs are failing in seconds with no steps executed. That is not a code
+          bug: the runs are being rejected before they start. Check the Actions
+          minute allowance / billing for the repository that owns the runs, not
+          the workflow code. This is exactly what happened on 2026-08-14, when
+          the private data repo hit 2,000/2,000 Free-plan minutes and the whole
+          pipeline went dark for 36 hours."
+          fi
+          BODY="${BODY}
+
+          Engine repo: databankbni/hf-spaces-backup (data, private).
+          Runner repo: ${GH_REPO} (public, free Actions minutes)."
           EXISTING=$(gh issue list --state open --label backup-stale --json number --jq '.[0].number' 2>/dev/null || true)
-          BODY="Backup appears stale: ${REASON}. Check the \`backup\` workflow runs and the HF_TOKEN secret validity."
           if [ -n "$EXISTING" ]; then
             gh issue comment "$EXISTING" --body "$BODY"
           else
             gh label create backup-stale --color fbca04 --description "Backup has not run recently" 2>/dev/null || true
-            gh issue create --title "Backup is stale" --body "$BODY" --label backup-stale
+            gh issue create --title "Backup pipeline degraded" --body "$BODY" --label backup-stale
           fi
 
       - name: Report
         if: steps.dedup.outputs.run == 'true'
-        run: echo "${{ steps.check.outputs.reason }}"
+        run: |
+          echo "freshness: ${{ steps.check.outputs.reason }}"
+          echo "history:   ${{ steps.hist.outputs.hist_reason }}"
