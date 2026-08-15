@@ -1,0 +1,202 @@
+name: overflow
+
+# Copies the blobs that are too large for git into the object store.
+#
+# Deliberately a separate workflow from `backup`:
+#   * different failure mode -- a stalled upload must never delay the pass that
+#     actually rescues Spaces before their owners delete them;
+#   * different cost -- this one moves tens of GB and is budget-limited, while
+#     the backup itself is a few hundred MB a day;
+#   * different permissions -- this one needs `contents: write` for releases.
+#
+# The checkout is sparse on purpose. Materialising the whole `spaces/` tree just
+# to read a few thousand small JSON manifests would pull ~16 GB onto the runner
+# for no reason.
+#
+# 2026-08-15: dipindah dari repo privat databankbni/hf-spaces-backup ke repo
+# publik databankbni/hf-spaces-runner. Kuota Actions repo privat (2.000
+# menit/bulan pada paket Free) habis 2026-08-14 04:20Z; sejak itu SEMUA run di
+# repo data ditolak sebelum langkah pertama. Menit Actions repo publik gratis.
+#
+# Dua hal yang WAJIB dipaku di sini karena repo runner != repo data:
+#   1. GITHUB_TOKEN diisi SHIP_PAT, bukan token bawaan workflow. Token bawaan
+#      hanya berkuasa di repo runner, sedangkan aset release harus ditulis ke
+#      repo data (`contents: write` di sana).
+#   2. BACKUP_REPO_SLUG menunjuk repo data. tools/overflow.py memakainya untuk
+#      ReleaseStore; kalau tidak, puluhan GB aset mendarat di repo runner dan
+#      manifest/objects.jsonl menaut ke tempat yang salah.
+
+on:
+  schedule:
+    # Weekly, not daily. Uploading tens of GB is wall-clock expensive.
+    - cron: "13 5 * * 6"
+  workflow_dispatch:
+    inputs:
+      budget_gb:
+        description: "Bytes to upload this run (GB)"
+        default: "8"
+      total_gb:
+        description: "Hard ceiling for the whole store (GB)"
+        default: "40"
+      max_object_mb:
+        # Measured against the real backlog, not picked round. 19,814 pending
+        # objects = 68.33 GiB but the free store only has 39.23 GB left; a
+        # 200 MB cap fits 19,724 of them (99.55%) in 35.90 GB with ~3.3 GB
+        # spare, while 250 MB needs 40.08 GB and overflows. The 90 left behind
+        # keep url + sha256 + LFS pointer in git, so nothing becomes unrecoverable.
+        description: "Skip single objects larger than this (MB)"
+        default: "200"
+      time_min:
+        description: "Wall-clock budget (minutes)"
+        default: "180"
+
+permissions:
+  # penjaga anti-dobel membaca daftar run workflow ini
+  actions: read
+  contents: read
+
+concurrency:
+  group: hf-overflow
+  cancel-in-progress: false
+
+jobs:
+  overflow:
+    runs-on: ubuntu-latest
+    timeout-minutes: 200
+    steps:
+      # Penjaga anti-dobel. Lihat tools/../addguard.py di catatan kerja:
+      # cron GitHub baru hidup 2026-08-05 (event schedule pertama akun ini,
+      # telat 3 jam), sementara jam luar sudah menembak workflow ini lewat
+      # workflow_dispatch. Tanpa ini, satu hari jalan dua kali.
+      #
+      # Hanya event `schedule` yang bisa dilewati, dan hanya kalau sudah ada
+      # run workflow_dispatch yang SUKSES dalam 72 jam terakhir. Kalau jam
+      # luar mati, tidak ada run seperti itu, dan cron GitHub tetap dipakai
+      # sebagai cadangan. GITHUB_REPOSITORY di sini sengaja repo runner:
+      # riwayat run sekarang tinggal di sini.
+      - name: Lewati kalau jam luar sudah menjalankannya
+        id: dedup
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WF: overflow.yml
+          WINDOW_H: '72'
+          EVENT: ${{ github.event_name }}
+          SELF: ${{ github.run_id }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import calendar, json, os, sys, time, urllib.request
+
+          def note(m):
+              print(m, file=sys.stderr)
+
+          ev = os.environ["EVENT"]
+          if ev != "schedule":
+              note(f"event={ev} -> jalan (jam luar / manual selalu menang)")
+              print("run=true"); raise SystemExit
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          wf = os.environ["WF"]
+          win = float(os.environ["WINDOW_H"])
+          me = os.environ["SELF"]
+          url = (f"https://api.github.com/repos/{repo}/actions/workflows/{wf}"
+                 f"/runs?per_page=30&status=success&event=workflow_dispatch")
+          req = urllib.request.Request(url, headers={
+              "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28"})
+          try:
+              with urllib.request.urlopen(req, timeout=30) as f:
+                  runs = json.load(f).get("workflow_runs", [])
+          except Exception as e:
+              note(f"API gagal ({e}) -> jalan (gagal-aman)")
+              print("run=true"); raise SystemExit
+
+          cutoff = time.time() - win * 3600
+          for r in runs:
+              if str(r.get("id")) == me:
+                  continue
+              try:
+                  ts = calendar.timegm(
+                      time.strptime(r["created_at"], "%Y-%m-%dT%H:%M:%SZ"))
+              except Exception:
+                  continue
+              if ts > cutoff:
+                  note(f"run sukses {r['id']} ({r['event']}) pada "
+                       f"{r['created_at']} masih dalam {win:g} jam -- "
+                       f"run jadwal ini DILEWATI")
+                  print("run=false"); raise SystemExit
+          note(f"tidak ada run workflow_dispatch sukses dalam {win:g} jam "
+               f"-> cron GitHub dipakai sebagai cadangan")
+          print("run=true")
+          PY
+
+      - name: Free runner disk
+        if: steps.dedup.outputs.run == 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/.ghcup /usr/local/share/boost \
+                      /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/Ruby \
+                      /opt/hostedtoolcache/go || true
+          df -h / | tail -1
+
+      # repository + token: kode dan manifest ada di repo LAIN yang privat.
+      # persist-credentials sengaja true -- langkah terakhir mendorong
+      # manifest/objects.jsonl kembali ke repo data lewat remote origin ini.
+      - uses: actions/checkout@v4
+        if: steps.dedup.outputs.run == 'true'
+        with:
+          repository: databankbni/hf-spaces-backup
+          token: ${{ secrets.SHIP_PAT }}
+          persist-credentials: true
+          fetch-depth: 1
+          sparse-checkout: |
+            /tools/
+            /manifest/
+            **/_lfs_skipped.json
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-python@v5
+        if: steps.dedup.outputs.run == 'true'
+        with:
+          python-version: "3.11"
+
+      - name: Upload overflow objects
+        if: steps.dedup.outputs.run == 'true'
+        env:
+          # SHIP_PAT, bukan github.token: aset release ditulis di repo data.
+          GITHUB_TOKEN: ${{ secrets.SHIP_PAT }}
+          BACKUP_REPO_SLUG: databankbni/hf-spaces-backup
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          # Keempat rahasia S3 ini memang belum ada (tidak pernah dibuat), jadi
+          # nilainya kosong dan tools/objstore.py jatuh ke ReleaseStore --
+          # backend gratis berbasis aset release, tanpa kredensial tambahan.
+          # Dibiarkan tertulis supaya begitu kunci S3 diisi, jalurnya langsung
+          # aktif tanpa mengubah workflow.
+          S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+          S3_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
+          S3_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_ACCESS_KEY }}
+          S3_PREFIX: ${{ vars.S3_PREFIX }}
+          OVERFLOW_BUDGET_GB: ${{ github.event.inputs.budget_gb || '8' }}
+          OVERFLOW_TOTAL_GB: ${{ github.event.inputs.total_gb || '40' }}
+          OVERFLOW_MAX_OBJECT_MB: ${{ github.event.inputs.max_object_mb || '200' }}
+          OVERFLOW_TIME_MIN: ${{ github.event.inputs.time_min || '180' }}
+          REPO_ROOT: ${{ github.workspace }}
+        run: python tools/overflow.py
+
+      - name: Commit the object index
+        if: steps.dedup.outputs.run == 'true'
+        run: |
+          git config user.name hf-backup-bot
+          git config user.email hf-backup-bot@users.noreply.github.com
+          git add manifest/objects.jsonl || true
+          if git diff --cached --quiet; then
+            echo "object index unchanged"; exit 0
+          fi
+          git commit -q -m "overflow: object index ($(date -u +%FT%TZ))"
+          for i in 1 2 3; do
+            git push --quiet origin HEAD:main && exit 0
+            git pull --rebase --autostash -q origin main || true
+            sleep $((5 * i))
+          done
+          exit 1
