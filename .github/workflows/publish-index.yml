@@ -1,0 +1,319 @@
+name: publish-index
+
+# ---------------------------------------------------------------------------
+# RUNNER PUBLIK. Data tetap privat di databankbni/hf-spaces-backup.
+#
+# 2026-08-14T04:20Z seluruh pipeline mati sekaligus. Sebabnya bukan kode:
+# kuota GitHub Actions untuk repo PRIVAT pada paket Free adalah 2.000
+# menit/bulan dan angka itu habis persis (2000/2000 di tagihan Agustus). Sejak
+# saat itu setiap job ditolak sebelum langkah pertama dengan anotasi "The job
+# was not started because recent account payments have failed or your spending
+# limit needs to be increased" -- log kosong, durasi ~2 detik, status failure.
+# Katalog beku di terbitan 14 Agustus 04:22 UTC (5.858 Space) sementara monitor
+# di Hugging Face terus mengurasi sampai 6.202 Space.
+#
+# Actions pada repo PUBLIK tidak memotong kuota itu sama sekali: repo publik
+# databankbni/hf-spaces-archive-index memakai 2.680 menit pada bulan yang sama
+# dengan tagihan nol. Jadi yang dipindah adalah WORKFLOW-nya, bukan datanya:
+#   * checkout menarik repo data lewat SHIP_PAT (fine-grained PAT)
+#   * BACKUP_REPO_SLUG memberi tahu tools/ repo data yang sebenarnya, karena
+#     GITHUB_REPOSITORY di sini menunjuk ke repo runner
+#   * publish memakai HTTPS + PAT, bukan PAGES_DEPLOY_KEY: kunci deploy itu
+#     hanya terpasang di repo lama dan nilainya tidak bisa dibaca ulang
+#
+# Konsekuensi yang disengaja: log run ini publik. Isinya ID Space (sudah publik
+# di katalog), jumlah berkas dan ukuran. Semua secret tetap ter-mask dan tidak
+# ada satu pun isi repo privat yang dicetak.
+# ---------------------------------------------------------------------------
+
+on:
+  schedule:
+    # Off the hour: the top of the hour is GitHub's most congested queue slot.
+    - cron: '7 0,6,12,18 * * *'   # ~6-hourly; 02:23 is the backup's own slot
+  workflow_dispatch:
+
+concurrency:
+  group: hf-publish-index
+  cancel-in-progress: true
+
+permissions:
+  # penjaga anti-dobel membaca daftar run workflow ini
+  actions: read
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # Penjaga anti-dobel: jam luar (ghtrigger.py di Space monitor) menembak
+      # workflow ini lewat workflow_dispatch, sementara cron GitHub juga hidup.
+      # Hanya event `schedule` yang bisa dilewati, dan hanya kalau sudah ada run
+      # workflow_dispatch SUKSES dalam 4 jam terakhir. Kalau jam luar mati,
+      # tidak ada run seperti itu dan cron GitHub tetap jadi cadangan.
+      #
+      # Repo yang dibaca di sini SENGAJA repo runner (GITHUB_REPOSITORY apa
+      # adanya): riwayat run workflow ini sekarang hidup di sini, bukan di repo
+      # data.
+      - name: Lewati kalau jam luar sudah menjalankannya
+        id: dedup
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WF: publish-index.yml
+          WINDOW_H: '4'
+          EVENT: ${{ github.event_name }}
+          SELF: ${{ github.run_id }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import calendar, json, os, sys, time, urllib.request
+
+          def note(m):
+              print(m, file=sys.stderr)
+
+          ev = os.environ["EVENT"]
+          if ev != "schedule":
+              note(f"event={ev} -> jalan (jam luar / manual selalu menang)")
+              print("run=true"); raise SystemExit
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          wf = os.environ["WF"]
+          win = float(os.environ["WINDOW_H"])
+          me = os.environ["SELF"]
+          url = (f"https://api.github.com/repos/{repo}/actions/workflows/{wf}"
+                 f"/runs?per_page=30&status=success&event=workflow_dispatch")
+          req = urllib.request.Request(url, headers={
+              "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28"})
+          try:
+              with urllib.request.urlopen(req, timeout=30) as f:
+                  runs = json.load(f).get("workflow_runs", [])
+          except Exception as e:
+              note(f"API gagal ({e}) -> jalan (gagal-aman)")
+              print("run=true"); raise SystemExit
+
+          cutoff = time.time() - win * 3600
+          for r in runs:
+              if str(r.get("id")) == me:
+                  continue
+              try:
+                  ts = calendar.timegm(
+                      time.strptime(r["created_at"], "%Y-%m-%dT%H:%M:%SZ"))
+              except Exception:
+                  continue
+              if ts > cutoff:
+                  note(f"run sukses {r['id']} ({r['event']}) pada "
+                       f"{r['created_at']} masih dalam {win:g} jam -- "
+                       f"run jadwal ini DILEWATI")
+                  print("run=false"); raise SystemExit
+          note(f"tidak ada run workflow_dispatch sukses dalam {win:g} jam "
+               f"-> cron GitHub dipakai sebagai cadangan")
+          print("run=true")
+          PY
+      # The manifest and archive JSONL are all this needs; the mirrored Space
+      # files are gigabytes and irrelevant here. `repository` + `token`: pohon
+      # kerjanya adalah repo DATA yang privat, bukan repo runner ini.
+      - uses: actions/checkout@v4
+        if: steps.dedup.outputs.run == 'true'
+        with:
+          repository: databankbni/hf-spaces-backup
+          token: ${{ secrets.SHIP_PAT }}
+          fetch-depth: 1
+          sparse-checkout: |
+            /tools/
+            /manifest/
+            /archive/
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-python@v5
+        if: steps.dedup.outputs.run == 'true'
+        with:
+          python-version: '3.11'
+
+      # Without this the job would faithfully republish whatever the last
+      # backup committed. archive/ is refreshed in the working tree only and
+      # deliberately never committed here: the daily backup stays the single
+      # writer of archive/ in git, so a 6-hourly cadence cannot bloat a repo
+      # that is already 11 GB. Spaces added since the last backup therefore
+      # appear with their curated metadata but no mirror stats yet, which is
+      # the honest state -- their files genuinely have not been fetched.
+      # Dua sumber, bukan satu. archive.db dari HF adalah sumber historis;
+      # cabang engine-state adalah temuan mesin luar yang tidak menyentuh HF
+      # sama sekali. Kalau HF hilang atau menolak, langkah ini tetap sukses
+      # selama salah satu sumber terbaca -- itulah inti mesin di luar HF.
+      # ENGINE_REPO wajib eksplisit sekarang: default-nya GITHUB_REPOSITORY,
+      # dan di runner publik itu repo yang salah (tidak punya engine-state).
+      - name: Refresh archive metadata (Hugging Face + mesin luar)
+        if: steps.dedup.outputs.run == 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          DATASET_REPO: js9ajs9as9/hf-spaces-archive
+          GITHUB_TOKEN: ${{ secrets.SHIP_PAT }}
+          ENGINE_REPO: databankbni/hf-spaces-backup
+          ENGINE_BRANCH: engine-state
+        run: |
+          for i in 1 2 3; do
+            python tools/refresh_archive.py && exit 0
+            echo "::warning::refresh attempt $i failed, retrying"
+            sleep 30
+          done
+          echo "::error::tidak ada sumber metadata yang bisa dibaca"
+          exit 1
+
+      # The public build carries no curation scores and is encrypted with the
+      # catalogue password. mkindex.py refuses to run --public without a
+      # non-empty password, so a missing secret fails the job instead of
+      # quietly publishing 3,800 records in the clear.
+      - name: Build the public catalogue
+        if: steps.dedup.outputs.run == 'true'
+        env:
+          CATALOGUE_PASSWORD: ${{ secrets.CATALOGUE_PASSWORD }}
+          BACKUP_REPO_SLUG: databankbni/hf-spaces-backup
+        run: |
+          pip install --quiet cryptography
+          python tools/mkindex.py --public \
+                 --password-env CATALOGUE_PASSWORD -o /tmp/public.html
+          ls -l /tmp/public.html
+          # Belt and braces: the plaintext must not survive into the artefact.
+          # The template carries none of these strings, so any hit is a leak
+          # and must fail the publish rather than scroll past in the log.
+          bad=0
+          for probe in cpu-basic gradio huggingface.co/spaces hf.space; do
+            n=$(grep -c -- "$probe" /tmp/public.html || true)
+            echo "leak probe '$probe': $n"
+            [ "$n" -eq 0 ] || bad=1
+          done
+          if [ "$bad" -ne 0 ]; then
+            echo "::error::plaintext leaked into the encrypted catalogue"
+            exit 1
+          fi
+
+      # Dulu langkah ini memakai PAGES_DEPLOY_KEY (kunci SSH). Kunci itu hanya
+      # hidup di repo lama dan tidak bisa dibaca ulang dari GitHub, jadi runner
+      # baru mendorong lewat HTTPS + PAT. Repo tujuan PUBLIK, jadi clone-nya
+      # anonim dan token hanya muncul di URL push -- tidak pernah tersimpan di
+      # .git/config maupun ter-commit.
+      - name: Publish
+        id: pub
+        if: env.PAGES_TOKEN != '' && steps.dedup.outputs.run == 'true'
+        env:
+          PAGES_TOKEN: ${{ secrets.SHIP_PAT }}
+          PAGES_SLUG: databankbni/hf-spaces-archive-index
+        run: |
+          set -u
+          rm -rf /tmp/pages
+          git clone -q --depth 1 "https://github.com/${PAGES_SLUG}.git" /tmp/pages
+          cp /tmp/public.html /tmp/pages/index.html
+          printf 'User-agent: *\nDisallow: /\n' > /tmp/pages/robots.txt
+          # Tanpa ini Pages menjalankan Jekyll atas index.html 5+ MB: build
+          # 2026-08-06T12:28Z berstatus "errored" dan yang 13:48Z menggantung
+          # >25 menit, jadi situs menyajikan halaman tujuh jam lebih tua tanpa
+          # ada yang merah. .nojekyll membuat Pages menyalin apa adanya.
+          : > /tmp/pages/.nojekyll
+          cd /tmp/pages
+          # Katalog ini berkas TURUNAN: riwayatnya tidak bernilai, sedangkan
+          # tiap terbit menambah ~5,7 MB. Jadi tiap terbit ditulis sebagai SATU
+          # commit yatim lalu dipaksa-dorong: penulis terakhir menang, riwayat
+          # tidak pernah menumpuk, dan perlombaan dengan workflow backup hilang
+          # dengan sendirinya. `git add -A` di atas hasil clone menjaga
+          # .github/workflows/ repo publik tetap ada di commit yatim itu.
+          git checkout -q --orphan terbit
+          git add -A
+          git -c user.name='hf-backup-bot' \
+              -c user.email='hf-backup-bot@users.noreply.github.com' \
+              commit -qm "catalogue: $(date -u +%Y-%m-%d\ %H:%M) UTC"
+          baru=$(git rev-parse HEAD)
+          if [ "$(git rev-parse --verify -q origin/main^{tree} || true)" \
+               = "$(git rev-parse HEAD^{tree})" ]; then
+            echo "catalogue unchanged"
+            echo "sha=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! git push -q -f \
+                 "https://x-access-token:${PAGES_TOKEN}@github.com/${PAGES_SLUG}.git" \
+                 terbit:main; then
+            echo "::error::could not push the catalogue"; exit 1
+          fi
+          echo "published $baru"
+          echo "sha=$baru" >> "$GITHUB_OUTPUT"
+
+      # Inang kedua, sengaja di penyedia yang berbeda. 2026-08-06 GitHub
+      # Actions + Pages major outage 7 jam: tiga deploy gagal, cron `schedule`
+      # tidak menyala sama sekali, dan katalog beku di 4.346 sementara monitor
+      # sudah melacak 4.423. Space statis HF tidak lewat Actions maupun Pages,
+      # jadi satu insiden penyedia tidak lagi membekukan katalog. Kegagalan di
+      # sini TIDAK menggagalkan terbit -- GitHub Pages tetap inang utama.
+      # Force-push idempoten: dijalankan walau katalog tidak berubah, supaya
+      # drift antar-inang ikut terbetulkan.
+      - name: Mirror to the Hugging Face static Space
+        if: steps.pub.outcome == 'success' && steps.dedup.outputs.run == 'true'
+        continue-on-error: true
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          SPACE: js9ajs9as9/ktlg-sijasja90sja0s9
+        run: |
+          set -u
+          if [ -z "${HF_TOKEN:-}" ]; then
+            echo "::warning::HF_TOKEN kosong, cermin dilewati"; exit 0
+          fi
+          if [ ! -s /tmp/public.html ]; then
+            echo "::warning::/tmp/public.html tidak ada, cermin dilewati"; exit 0
+          fi
+          rm -rf /tmp/cermin && mkdir -p /tmp/cermin && cd /tmp/cermin
+          git init -q
+          cp /tmp/public.html index.html
+          printf 'User-agent: *\nDisallow: /\n' > robots.txt
+          cat > README.md <<'EOF'
+          ---
+          title: Katalog
+          emoji: "\U0001F4DA"
+          colorFrom: gray
+          colorTo: gray
+          sdk: static
+          pinned: false
+          ---
+
+          Cermin katalog. Isi terenkripsi AES-256-GCM; perlu kata sandi.
+          EOF
+          sed -i 's/^          //' README.md
+          git add -A
+          git -c user.name='hf-backup-bot' \
+              -c user.email='hf-backup-bot@users.noreply.github.com' \
+              commit -qm "katalog: cermin $(date -u +%Y-%m-%dT%H:%MZ)"
+          git branch -M main
+          # Token hanya hidup di URL remote yang tidak pernah di-commit.
+          if git push -q -f \
+               "https://js9ajs9as9:${HF_TOKEN}@huggingface.co/spaces/${SPACE}" main; then
+            echo "cermin terkirim ke ${SPACE}"
+          else
+            echo "::warning::cermin HF gagal; inang utama tetap terbit"
+          fi
+
+      - name: Confirm the page serves what we published
+        if: steps.dedup.outputs.run == 'true' && steps.pub.outputs.sha != ''
+        run: |
+          # Repo runner ini PUBLIK, jadi menitnya gratis dan menunggu deploy
+          # Pages di sini tidak lagi memakan kuota. Yang berwenang tetap
+          # workflow `pages` di repo publik hf-spaces-archive-index: ia
+          # membandingkan byte halaman tayang dengan artefaknya dan GAGAL kalau
+          # basi. Di sini cukup konfirmasi cepat.
+          for i in $(seq 1 15); do
+            code=$(curl -s -o /tmp/live.html -w '%{http_code}' -L \
+              -H 'Cache-Control: no-cache' \
+              "https://databankbni.github.io/hf-spaces-archive-index/?cb=$i$RANDOM")
+            [ "$code" = "200" ] && cmp -s /tmp/live.html /tmp/public.html && break
+            sleep 20
+          done
+          if cmp -s /tmp/live.html /tmp/public.html; then
+            echo "live page is byte-identical to the build"
+          else
+            echo "::notice::deploy Pages masih jalan; hasil akhirnya diputuskan" \
+                 "workflow 'pages' di databankbni/hf-spaces-archive-index"
+          fi
+          rc=$(curl -s -o /tmp/rb.txt -w '%{http_code}' -L \
+            https://databankbni.github.io/hf-spaces-archive-index/robots.txt)
+          if [ "$rc" = "200" ] && grep -q 'Disallow: /' /tmp/rb.txt; then
+            echo "robots.txt served and disallows crawlers"
+          else
+            echo "::warning::robots.txt not served (HTTP $rc)"
+          fi
