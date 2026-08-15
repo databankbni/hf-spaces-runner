@@ -1,0 +1,129 @@
+name: ui-test
+
+# Jaring pengaman katalog. Sampai 2026-08-06 tidak ada satu pun workflow yang
+# menjalankan tools/test_index_ui.py, jadi suite itu hanya pernah jalan di
+# tangan manusia -- dan itulah sebabnya bug 404 lolos ke publik: tombol
+# "Lihat file backup" di modal menunjuk ke repo backup yang PRIVAT, dan
+# suite-nya justru MENGUJI bahwa tautan itu masuk ke repo (assertion-nya
+# mengabadikan bug-nya).
+#
+# Ini sengaja TIDAK menyentuh publish: kalau merah, katalog terakhir tetap
+# tayang. Yang terjadi hanya screenshot diunggah sebagai artefak dan sebuah
+# issue dibuka.
+#
+# 2026-08-15: dipindah dari repo privat databankbni/hf-spaces-backup ke repo
+# publik databankbni/hf-spaces-runner karena kuota Actions repo privat habis
+# (2.000/2.000 menit, mentok 2026-08-14 04:20Z). Kode mesin tetap di repo data
+# yang privat dan diambil lewat checkout dengan SHIP_PAT.
+#
+# KONSEKUENSI yang harus disadari: pemicu `push` pada tools/index_template.html
+# dkk HILANG, karena berkas-berkas itu ada di repo LAIN. Selama repo data belum
+# punya menit Actions, suite ini hanya jalan sesuai jadwal (Senin) atau manual.
+# Praktiknya tiap perubahan template memang diikuti dispatch manual.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/ui-test.yml'
+  schedule:
+    # Jauh dari slot publish (0,6,12,18:27) dan backup (02:43 / 03:43).
+    - cron: '41 5 * * 1'   # Senin 05:41 UTC
+
+concurrency:
+  group: hf-ui-test
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  ui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # Pola checkout persis seperti publish-index.yml: hanya tools/,
+      # manifest/, archive/. Direktori spaces/ berisi ~15,9 GB mirror dan
+      # sama sekali tidak dipakai oleh generator katalog.
+      - uses: actions/checkout@v4
+        with:
+          repository: databankbni/hf-spaces-backup
+          token: ${{ secrets.SHIP_PAT }}
+          fetch-depth: 1
+          sparse-checkout: |
+            /tools/
+            /manifest/
+            /archive/
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Pasang Playwright + Chromium
+        run: |
+          pip install --quiet cryptography playwright
+          python -m playwright install --with-deps chromium
+
+      # Uji swhtree lebih dulu: cepat, tanpa jaringan, dan yang diperiksa
+      # adalah klaim yang seluruh arsip per-Space bergantung padanya --
+      # SWHID direktori == sha1 tree git. Kalau itu pecah, indeks per-Space
+      # salah dan katalog akan menaut ke direktori yang tidak ada.
+      - name: Uji pemetaan shard + hash pohon (swhtree)
+        run: python tools/test_swhtree.py
+
+      # Dua build, karena keduanya punya jalur kode berbeda di template:
+      # build privat (plaintext) masih boleh menaut ke repo, build publik
+      # (terenkripsi) tidak boleh -- justru itu yang harus dijaga.
+      #
+      # BACKUP_REPO_SLUG wajib: mkindex.py membaca slug repo DATA dari sini
+      # (dulu dari GITHUB_REPOSITORY, yang sekarang menunjuk repo runner).
+      # Template memakai slug itu untuk tautan pohon per-Space.
+      - name: Bangun kedua katalog
+        env:
+          CATALOGUE_PASSWORD: ${{ secrets.CATALOGUE_PASSWORD }}
+          BACKUP_REPO_SLUG: databankbni/hf-spaces-backup
+        run: |
+          set -e
+          mkdir -p /tmp/shots
+          python tools/mkindex.py -o /tmp/plain.html
+          python tools/mkindex.py --public \
+                 --password-env CATALOGUE_PASSWORD -o /tmp/pub.html
+          ls -l /tmp/plain.html /tmp/pub.html
+          [ -s /tmp/plain.html ] && [ -s /tmp/pub.html ]
+
+      - name: Jalankan suite di browser sungguhan
+        env:
+          CATPW: ${{ secrets.CATALOGUE_PASSWORD }}
+          ENC: /tmp/pub.html
+          PLAIN: /tmp/plain.html
+          SHOTS: /tmp/shots
+        run: python tools/test_index_ui.py
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ui-shots
+          path: /tmp/shots
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Buka issue kalau suite merah
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner, repo: context.repo.repo,
+              title: `ui-test merah pada run ${context.runId}`,
+              body: [
+                'Suite katalog (tools/test_index_ui.py) gagal.',
+                '',
+                `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+                'Screenshot ada di artefak `ui-shots`.',
+                '',
+                'Kode mesin diambil dari databankbni/hf-spaces-backup@main.',
+                'Katalog yang sudah tayang TIDAK ikut diubah oleh workflow ini.'
+              ].join('\n')
+            });
