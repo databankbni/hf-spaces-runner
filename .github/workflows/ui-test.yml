@@ -84,6 +84,7 @@ jobs:
         env:
           CATALOGUE_PASSWORD: ${{ secrets.CATALOGUE_PASSWORD }}
           BACKUP_REPO_SLUG: databankbni/hf-spaces-backup
+          BACKUP_REPO_BRANCH: main
         run: |
           set -e
           mkdir -p /tmp/shots
