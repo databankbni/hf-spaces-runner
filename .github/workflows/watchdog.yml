@@ -197,6 +197,87 @@ jobs:
       # Sparse ON PURPOSE. Pohon kerja repo data sudah 15,9 GB + ~5 GB .git,
       # sementara runner ubuntu-latest hanya punya ~14 GB kosong di disk OS.
       # Run 30978760164 (2026-08-05 05:39Z) mati di tengah checkout penuh
+      # ---------------------------------------------------------------- #
+      # Titik buta yang terbukti mahal (insiden 2026-08-18 s/d 19).
+      #
+      # Backup hijau, publish hijau, Space "RUNNING", freshness manifest lolos
+      # -- tapi katalog beku 6.776 baris selama ~36 jam dan watchdog diam.
+      # Sebabnya: seluruh kolam 404 kunci Cerebras dijawab HTTP 402
+      # payment_required, jadi mesin kurasi mati sementara semua yang diawasi
+      # watchdog tetap sehat. Tidak ada satu pun pemeriksaan yang menanyakan
+      # "apakah arsip masih BERTAMBAH?".
+      #
+      # Sekarang watchdog membaca /health monitor:
+      #   llm.ready=false   -> LLM mati; arsip lanjut di mode darurat (uji asap
+      #                        deterministik, tanpa nilai kurasi) dan akan
+      #                        dinilai ulang oleh curator.backfill() nanti.
+      #   queue_depth besar -> kandidat menumpuk, pekerja tidak menghabiskannya.
+      #   mayoritas reject "llm plan error" -> tanda LLM mati pada versi lama
+      #                        /health yang belum punya blok llm.
+      - name: Periksa kesehatan kurasi (monitor /health)
+        if: steps.dedup.outputs.run == 'true'
+        id: mon
+        env:
+          MONITOR: ${{ vars.MONITOR_SPACE || 'js9ajs9as9/mntor-sijasja90sja0s9' }}
+          QUEUE_LIMIT: '250'
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, sys, urllib.request
+
+          def note(m):
+              print(m, file=sys.stderr)
+
+          space = os.environ["MONITOR"].strip()
+          host = space.replace("/", "-").replace(".", "-").lower()
+          url = f"https://{host}.hf.space/health"
+          try:
+              req = urllib.request.Request(
+                  url, headers={"User-Agent": "hf-spaces-archive-bot/1.0"})
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  h = json.load(r)
+          except Exception as e:
+              # monitor tak terjangkau: itu sendiri sudah alarm
+              print("llm_down=true")
+              print(f"mon_reason=monitor /health tak terjangkau: {e!r}"[:400])
+              raise SystemExit
+
+          llm = h.get("llm") or {}
+          st = h.get("stats") or {}
+          rj = h.get("rejects") or []
+          q = int(h.get("queue_depth") or 0)
+          limit = int(os.environ.get("QUEUE_LIMIT") or 250)
+
+          bad = [str(r.get("reason", "")).lower() for r in rj if isinstance(r, dict)]
+          nllm = sum(1 for r in bad if "llm plan error" in r or "402" in r)
+          share = (nllm / len(bad)) if bad else 0.0
+
+          ready = llm.get("ready")
+          why = []
+          if ready is False:
+              why.append(
+                  f"LLM MATI: model={llm.get('model')} kunci={llm.get('keys')} "
+                  f"terpakai={llm.get('keys_usable')} "
+                  f"cooldown_paywall={llm.get('paywall_cooldown_s')}s "
+                  f"cadangan={llm.get('fallback_providers')} "
+                  f"galat={str(llm.get('last_error'))[:120]}")
+          if ready is None and share >= 0.4:
+              why.append(f"{nllm}/{len(bad)} penolakan terakhir gagal karena LLM")
+          if q >= limit:
+              why.append(f"antrean menumpuk: {q} kandidat (ambang {limit})")
+
+          reason = ("; ".join(why) if why else
+                    f"kurasi sehat: llm.ready={ready} antrean={q} "
+                    f"arsip={st.get('archived_total')} darurat={st.get('degraded')} "
+                    f"ditunda={st.get('deferred')}")
+          # $GITHUB_OUTPUT satu baris per nilai: galat LLM bisa memuat newline.
+          reason = " ".join(reason.split())[:400]
+          print(f"llm_down={'true' if why else 'false'}")
+          print(f"mon_reason={reason}")
+          note(f"/health: count={h.get('count')} queue={q} "
+               f"archived_total={st.get('archived_total')} "
+               f"degraded={st.get('degraded')} llm.ready={ready}")
+          PY
+
       # tanpa meninggalkan log -- tanda khas runner kehabisan disk. Watchdog
       # cuma membaca satu berkas, manifest/summary.json.
       #
@@ -248,7 +329,8 @@ jobs:
       - name: Alert on stale or failing backup
         if: >-
           steps.dedup.outputs.run == 'true' &&
-          (steps.check.outputs.stale == 'true' || steps.hist.outputs.degraded == 'true')
+          (steps.check.outputs.stale == 'true' || steps.hist.outputs.degraded == 'true' ||
+           steps.mon.outputs.llm_down == 'true')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
@@ -256,6 +338,8 @@ jobs:
           HIST: ${{ steps.hist.outputs.hist_reason }}
           STALE: ${{ steps.check.outputs.stale }}
           BLOCKED: ${{ steps.hist.outputs.blocked }}
+          MON: ${{ steps.mon.outputs.mon_reason }}
+          LLM_DOWN: ${{ steps.mon.outputs.llm_down }}
         run: |
           BODY="Backup pipeline needs attention."
           if [ "$STALE" = "true" ]; then
@@ -263,7 +347,20 @@ jobs:
           - manifest stale: ${REASON}"
           fi
           BODY="${BODY}
-          - run history: ${HIST}"
+          - run history: ${HIST}
+          - kurasi/monitor: ${MON}"
+          if [ "$LLM_DOWN" = "true" ]; then
+            BODY="${BODY}
+
+          Mesin kurasi (LLM) tidak bisa dipakai. Arsip TIDAK berhenti: monitor
+          masuk mode darurat (uji asap deterministik tanpa nilai kurasi) dan
+          curator.backfill() akan menilai ulang catatan itu begitu ada LLM
+          sungguhan. Yang perlu dilakukan: pulihkan tagihan Cerebras, ATAU isi
+          salah satu secret Space berikut supaya jalur cadangan hidup --
+          GROQ_KEYS / GOOGLE_AI_KEYS / OPENROUTER_KEYS / LLM_EXTRA_PROVIDERS.
+          Konteks: 2026-08-18 seluruh kolam 404 kunci Cerebras balas HTTP 402
+          payment_required dan katalog beku 36 jam tanpa satu pun alarm."
+          fi
           if [ "$BLOCKED" = "true" ]; then
             BODY="${BODY}
 
@@ -291,3 +388,4 @@ jobs:
         run: |
           echo "freshness: ${{ steps.check.outputs.reason }}"
           echo "history:   ${{ steps.hist.outputs.hist_reason }}"
+          echo "kurasi:    ${{ steps.mon.outputs.mon_reason }}"
