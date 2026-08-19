@@ -270,7 +270,7 @@ jobs:
                     f"arsip={st.get('archived_total')} darurat={st.get('degraded')} "
                     f"ditunda={st.get('deferred')}")
           # $GITHUB_OUTPUT satu baris per nilai: galat LLM bisa memuat newline.
-          reason = " ".join(reason.split())[:400]
+          reason = " ".join(reason.split()).replace('"', "'").replace("`", "'")[:400]
           print(f"llm_down={'true' if why else 'false'}")
           print(f"mon_reason={reason}")
           note(f"/health: count={h.get('count')} queue={q} "
@@ -383,9 +383,17 @@ jobs:
             gh issue create --title "Backup pipeline degraded" --body "$BODY" --label backup-stale
           fi
 
+      # Alasan dilewatkan sebagai env, BUKAN diinterpolasi langsung ke shell:
+      # galat LLM memuat badan JSON dengan tanda kutip ("message": ...) dan
+      # echo "...${{ }}..." pecah jadi sintaks bash tak sah (run 32291378974
+      # gagal exit 2 padahal pemeriksaannya benar).
       - name: Report
         if: steps.dedup.outputs.run == 'true'
+        env:
+          REASON: ${{ steps.check.outputs.reason }}
+          HIST: ${{ steps.hist.outputs.hist_reason }}
+          MON: ${{ steps.mon.outputs.mon_reason }}
         run: |
-          echo "freshness: ${{ steps.check.outputs.reason }}"
-          echo "history:   ${{ steps.hist.outputs.hist_reason }}"
-          echo "kurasi:    ${{ steps.mon.outputs.mon_reason }}"
+          echo "freshness: $REASON"
+          echo "history:   $HIST"
+          echo "kurasi:    $MON"
